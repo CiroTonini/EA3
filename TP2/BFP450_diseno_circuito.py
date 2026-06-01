@@ -20,26 +20,31 @@ import math
 import os
 import re
 import pandas as pd
+import numpy as np
+import json
 import skrf as rf
 
 # ─── CONFIGURACIÓN ──────────────────────────────────────────────────────────
 UPLOAD_DIR = r"C:\Users\cirov\OneDrive\Documents\MATERIAS\EA3\TP2\s2p"
-F_DESIGN   = 2.2          # GHz — frecuencia de diseño
+F_DESIGN   = 2.2      # GHz — frecuencia de diseño
 Z0         = 50.0         # Ω   — impedancia característica (= Rgen = RL)
-ER         = 4.4          # FR-4
-H_MM       = 1.6          # mm
-T_UM       = 35           # µm
+ER         = 4        # FR-4
+H_MM       = 1.57         # mm
+T_UM       = 27.5        # µm
 IC_MIN_MA  = 10           # mA — descartar puntos por debajo
+
+L_CHOKE_NH   = 100.0   # nH — inductancia de choque deseada
+C_DECOUP_PF  =  10.0   # pF — capacitor de desacople deseado
+Z0_CHOKE_MIN, Z0_CHOKE_MAX   = 100.0, 250.0   # Ω — rango Z0 microtira choke
+Z0_DECOUP_MIN, Z0_DECOUP_MAX =  20.0,  60.0   # Ω — rango Z0 microtira desacople
 
 
 # ─── FUNCIONES AUXILIARES ───────────────────────────────────────────────────
 def load_s2p(path, f_ghz):
-    """Carga un .s2p e interpola a la frecuencia de diseño."""
     ntwk = rf.Network(path)
-    f_target = rf.Frequency(f_ghz * 1e9, f_ghz * 1e9, 1, unit='hz')
-    s = ntwk.interpolate(f_target).s[0]
+    idx = np.argmin(np.abs(ntwk.f - f_ghz * 1e9))
+    s = ntwk.s[idx]
     return s[0, 0], s[1, 0], s[0, 1], s[1, 1]
-
 
 def analyze(S11, S21, S12, S22, Z0=50.0):
     """Estabilidad y adaptación simultánea conjugada (Gonzalez/Pozar)."""
@@ -82,7 +87,7 @@ def analyze(S11, S21, S12, S22, Z0=50.0):
         S11=S11, S21=S21, S12=S12, S22=S22,
         K=K, delta=abs(delta), estable=estable,
         Zs=Zs, ZL=ZL, Zin=Zin, Zout=Zout,
-        GT_dB =10 * math.log10(GT),
+        GT_dB =10 * math.log10(GT) if GT > 0 else float('nan'),
         MAG_dB=10 * math.log10(MAG) if MAG else float('nan'),
         MSG_dB=10 * math.log10(MSG),
         S11_dB=20 * math.log10(abs(S11)),
@@ -107,7 +112,37 @@ def microstrip(Zc, er=4.4, h_mm=1.6, f_ghz=2.2):
     er_eff = ((er + 1)/2 + (er - 1)/2 * (1 / math.sqrt(1 + 12 / Wh))) if Wh >= 1 else \
              ((er + 1)/2 + (er - 1)/2 * (1 / math.sqrt(1 + 12 / Wh) + 0.04 * (1 - Wh)**2))
     lam = c / (f * math.sqrt(er_eff))
-    return W * 1e3, lam / 4 * 1e3
+    return W * 1e3, lam / 4 * 1e3, er_eff
+
+
+def stub_length_mm(Xc, Z0_stub, er_eff, f_ghz):
+    """Largo físico [mm] del stub que sintetiza la reactancia Xc.
+    l = arccot(Xc/Z0) · λg / (2π),  con λg = c/(f·√ε_eff).
+    arccot(x) = atan2(1, x) → resultado ∈ (0, π).
+    """
+    lam_g = 3e8 / (f_ghz * 1e9 * math.sqrt(er_eff))
+    theta  = math.atan2(1.0, Xc / Z0_stub)
+    return theta * lam_g / (2 * math.pi) * 1e3
+
+
+def bias_stub(value_SI, is_inductor, Z0_ohm, f_ghz, er, h_mm):
+    """
+    Microtira para red de polarización.
+    Choke   (stub CC shunt): Z_in = jZ0·tan(θ) = jωL  → θ = arctan(ωL/Z0)
+    Desacop (stub CA shunt): Z_in = −j/(ωC)           → θ = arctan(ωC·Z0)
+    Retorna: (W_mm, l_mm, theta_deg, X_ohm)
+    """
+    omega = 2 * math.pi * f_ghz * 1e9
+    W_mm, lam4_mm, _ = microstrip(Z0_ohm, er, h_mm, f_ghz)
+    lam_g_mm = lam4_mm * 4
+    if is_inductor:
+        theta = math.atan(omega * value_SI / Z0_ohm)
+        X_ohm = omega * value_SI
+    else:
+        theta = math.atan(omega * value_SI * Z0_ohm)
+        X_ohm = 1.0 / (omega * value_SI)
+    l_mm = theta * lam_g_mm / (2 * math.pi)
+    return W_mm, l_mm, math.degrees(theta), X_ohm
 
 
 def serie_a_paralelo(R, X):
@@ -252,8 +287,8 @@ print(t2.to_string(index=False))
 
 # ─── TABLA 3 ▸ Microtiras de la red de adaptación ───────────────────────────
 # Topología (EA3 TP2):
-#   Entrada: cancelar X de Zin con C en paralelo  →  λ/4 con Z0 = √(Rgen·Rin_p)
-#   Salida : λ/4 con Z0 = √(RL·Rout_s)            →  cancelar X transformada con C
+#   Entrada: cancelar Xin_p con shunt  →  λ/4 con Z0 = √(Rgen·Rin_p)
+#   Salida : λ/4 con Z0 = √(RL·Rout_s)  →  serie Xout_s → paralelo XL_p = −Z0²/Xout_s
 Rin_s,  Xin_s  = Zin_e.real,  Zin_e.imag
 Rout_s, Xout_s = Zout_e.real, Zout_e.imag
 
@@ -261,9 +296,9 @@ Rin_p, Xin_p = serie_a_paralelo(Rin_s, Xin_s)
 Z_QW_in  = math.sqrt(Z0 * Rin_p)
 Z_QW_out = math.sqrt(Z0 * Rout_s)
 
-W_50,   l4_50   = microstrip(50.0,      ER, H_MM, F_DESIGN)
-W_QWi,  l4_QWi  = microstrip(Z_QW_in,   ER, H_MM, F_DESIGN)
-W_QWo,  l4_QWo  = microstrip(Z_QW_out,  ER, H_MM, F_DESIGN)
+W_50,   l4_50,  er_50   = microstrip(50.0,      ER, H_MM, F_DESIGN)
+W_QWi,  l4_QWi, er_QWi = microstrip(Z_QW_in,   ER, H_MM, F_DESIGN)
+W_QWo,  l4_QWo, er_QWo = microstrip(Z_QW_out,  ER, H_MM, F_DESIGN)
 
 print("\n  TABLA 3 ▸ Microtiras de la red de adaptación")
 print('  ' + '─' * 88)
@@ -285,32 +320,90 @@ print(t3.to_string(index=False))
 
 # Componentes de cancelación
 f_hz = F_DESIGN * 1e9
-X_out_p_after_QW = Z_QW_out**2 / Xout_s if Xout_s != 0 else 0.0
+# Salida: la reactancia serie Xout_s, tras el λ/4, aparece en PARALELO en el lado de 50 Ω:
+#   XL_p = −Z0(QWout)² / Xout_s   (si Xout_s<0 → XL_p>0 → inductivo → cancelar con C shunt)
+XL_p_out = -(Z_QW_out**2) / Xout_s if Xout_s != 0 else 0.0
 
 print(f"\n  Componentes para cancelación de reactancia:")
 print(f"   • Entrada  →  Rin_p = {Rin_p:7.3f} Ω,  Xin_p = {Xin_p:+7.3f} Ω")
 if Xin_p > 0:
     C_in = 1 / (2 * math.pi * f_hz * Xin_p)
-    print(f"                cancelar con C en paralelo de {C_in*1e12:6.3f} pF "
+    print(f"                cancelar con C shunt de {C_in*1e12:6.3f} pF "
           f"(o stub equivalente)")
+    l_stub_in = stub_length_mm(Xin_p, Z0, er_50, F_DESIGN)
+    print(f"                stub abierto shunt (Z0={Z0:.0f} Ω):  "
+          f"W = {W_50:.3f} mm,  l = {l_stub_in:.3f} mm")
 elif Xin_p < 0:
     L_in = abs(Xin_p) / (2 * math.pi * f_hz)
-    print(f"                cancelar con L en paralelo de {L_in*1e9:6.3f} nH "
+    print(f"                cancelar con L shunt de {L_in*1e9:6.3f} nH "
           f"(o stub equivalente)")
+    l_stub_in = stub_length_mm(Xin_p, Z0, er_50, F_DESIGN)
+    print(f"                stub CC shunt (Z0={Z0:.0f} Ω):  "
+          f"W = {W_50:.3f} mm,  l = {l_stub_in:.3f} mm")
 
 print(f"   • Salida   →  Rout_s = {Rout_s:7.3f} Ω, Xout_s = {Xout_s:+7.3f} Ω")
-print(f"                X transformada tras λ/4 = {X_out_p_after_QW:+7.3f} Ω")
-if X_out_p_after_QW > 0:
-    C_out = 1 / (2 * math.pi * f_hz * X_out_p_after_QW)
-    print(f"                cancelar con C en paralelo de {C_out*1e12:6.3f} pF "
+print(f"                XL_p (paralelo tras λ/4) = {XL_p_out:+7.3f} Ω")
+if XL_p_out > 0:
+    C_out = 1 / (2 * math.pi * f_hz * XL_p_out)
+    print(f"                cancelar con C shunt de {C_out*1e12:6.3f} pF "
           f"(o stub equivalente)")
-elif X_out_p_after_QW < 0:
-    L_out = abs(X_out_p_after_QW) / (2 * math.pi * f_hz)
-    print(f"                cancelar con L en paralelo de {L_out*1e9:6.3f} nH "
+    l_stub_out = stub_length_mm(XL_p_out, Z0, er_50, F_DESIGN)
+    print(f"                stub abierto shunt (Z0={Z0:.0f} Ω):  "
+          f"W = {W_50:.3f} mm,  l = {l_stub_out:.3f} mm")
+elif XL_p_out < 0:
+    L_out = abs(XL_p_out) / (2 * math.pi * f_hz)
+    print(f"                cancelar con L shunt de {L_out*1e9:6.3f} nH "
           f"(o stub equivalente)")
+    l_stub_out = stub_length_mm(XL_p_out, Z0, er_50, F_DESIGN)
+    print(f"                stub CC shunt (Z0={Z0:.0f} Ω):  "
+          f"W = {W_50:.3f} mm,  l = {l_stub_out:.3f} mm")
 
-print(f"\n  Para la red de polarización (no incluida arriba):")
-print(f"   • Choke  Lch  →  microtira de Z0 alto  (≈ 100 – 250 Ω), largo λ/4")
-print(f"   • Decoup C    →  microtira de Z0 bajo  (≈  20 –  60 Ω), largo λ/4")
+# ─── TABLA 4 ▸ Red de polarización (choke + desacople) ──────────────────────
+omega_d   = 2 * math.pi * F_DESIGN * 1e9
+XL_choke  = omega_d * L_CHOKE_NH  * 1e-9
+XC_decoup = 1.0 / (omega_d * C_DECOUP_PF * 1e-12)
+
+print(f"\n  TABLA 4 ▸ Red de polarización — inductor de choque y capacitor de desacople")
+print(f"   L = {L_CHOKE_NH:.0f} nH  →  XL = {XL_choke:.1f} Ω  @ {F_DESIGN} GHz   "
+      f"(stub CC shunt,  Z0 ∈ [{Z0_CHOKE_MIN:.0f}, {Z0_CHOKE_MAX:.0f}] Ω)")
+print(f"   C = {C_DECOUP_PF:.0f} pF  →  XC = {XC_decoup:.2f} Ω  @ {F_DESIGN} GHz   "
+      f"(stub CA shunt,  Z0 ∈ [{Z0_DECOUP_MIN:.0f}, {Z0_DECOUP_MAX:.0f}] Ω)")
+print('  ' + '─' * 96)
+
+rows_t4 = []
+for Z0_c in [Z0_CHOKE_MIN, (Z0_CHOKE_MIN + Z0_CHOKE_MAX) / 2, Z0_CHOKE_MAX]:
+    W_mm, l_mm, theta_deg, _ = bias_stub(
+        L_CHOKE_NH * 1e-9, True, Z0_c, F_DESIGN, ER, H_MM)
+    rows_t4.append({
+        'Componente': f'Choke  {L_CHOKE_NH:.0f} nH',
+        'Tipo stub':   'CC shunt',
+        'Z0 (Ω)':     f"{Z0_c:6.1f}",
+        'θ (°)':      f"{theta_deg:5.1f}",
+        'W (mm)':     f"{W_mm:7.3f}",
+        'l (mm)':     f"{l_mm:7.3f}",
+    })
+
+for Z0_d in [Z0_DECOUP_MIN, (Z0_DECOUP_MIN + Z0_DECOUP_MAX) / 2, Z0_DECOUP_MAX]:
+    W_mm, l_mm, theta_deg, _ = bias_stub(
+        C_DECOUP_PF * 1e-12, False, Z0_d, F_DESIGN, ER, H_MM)
+    rows_t4.append({
+        'Componente': f'Desacople  {C_DECOUP_PF:.0f} pF',
+        'Tipo stub':   'CA shunt',
+        'Z0 (Ω)':     f"{Z0_d:6.1f}",
+        'θ (°)':      f"{theta_deg:5.1f}",
+        'W (mm)':     f"{W_mm:7.3f}",
+        'l (mm)':     f"{l_mm:7.3f}",
+    })
+
+t4 = pd.DataFrame(rows_t4)
+print(t4.to_string(index=False))
+
+OUT_DIR = "tablas_csv"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+t1.to_csv(os.path.join(OUT_DIR, "tabla1_parametros_S.csv"), index=False)
+t2.to_csv(os.path.join(OUT_DIR, "tabla2_impedancias.csv"), index=False)
+t3.to_csv(os.path.join(OUT_DIR, "tabla3_microtiras.csv"), index=False)
+t4.to_csv(os.path.join(OUT_DIR, "tabla4_polarizacion.csv"), index=False)
 
 print("\nScript finalizado.\n")
